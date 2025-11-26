@@ -1,6 +1,6 @@
 import cv2
 import numpy as np
-from pythonosc import udp_client
+# from pythonosc import udp_client # OSC 통신을 위해 필요했으나 현재는 사운드 자체 생성을 위해 주석 처리함
 import time
 import math
 import sounddevice as sd
@@ -8,16 +8,18 @@ import queue
 import threading
 import collections
 import random
+import subprocess
+import platform
 
 # --- 1. 설정 (Configuration) ---
 CAMERA_INDEX = 0
 FRAME_WIDTH = 1920
 FRAME_HEIGHT = 1080
 
-# --- OSC 설정 ---
-OSC_IP = "192.168.0.2"
-OSC_PORT = 8000
-OSC_ADDRESS = "/shadow_data"
+# --- OSC 설정 (현재 사용 안함 - 주석 처리) ---
+# OSC_IP = "192.168.0.2"
+# OSC_PORT = 8000
+# OSC_ADDRESS = "/shadow_data"
 
 # --- 시각화 옵션 ---
 # 뷰 모드: 1 = Minimal Debug Visual, 2 = Binary Mask
@@ -59,16 +61,148 @@ glitch_active = False
 GLITCH_STRENGTH = 20
 GLITCH_NUM_EFFECTS = 5
 
-# --- 오디오 설정 ---
+# --- 오디오 설정 (Sound Engine) ---
 SAMPLERATE = 44100
-BLOCKSIZE = 1024
-CHANNELS = 1
-AUDIO_DEVICE_INDEX = None
-q = queue.Queue()
+BLOCKSIZE = 1024 # Latency vs Stability
+CHANNELS = 2 # Stereo for spatial effects
 
-# current_fft_data는 이제 사용하지 않으므로 삭제합니다.
-# current_fft_data = np.zeros(BLOCKSIZE // 2, dtype=np.float32) 
-audio_data_lock = threading.Lock()
+class SoundEngine:
+    def __init__(self):
+        self.active = True
+        self.start_time = time.time()
+        self.phase = 0 # 0: Intro, 1: Build-up, 2: Climax/Noise
+        
+        # Tracking Data
+        self.shadow_detected = False
+        self.norm_dist = 0.0
+        self.angle = 0.0
+        self.shadow_x = 0
+        self.shadow_y = 0
+        
+        # Audio State
+        self.phase_accumulator = 0.0
+        self.pulse_accumulator = 0.0
+        self.glitch_timer = 0.0
+        
+        # Performance Config
+        self.total_duration = 180.0 # 3 minutes
+        
+        # Stream
+        self.stream = sd.OutputStream(
+            samplerate=SAMPLERATE,
+            blocksize=BLOCKSIZE,
+            channels=CHANNELS,
+            callback=self.callback
+        )
+        self.stream.start()
+
+    def update_tracking(self, detected, x, y, dist, angle):
+        self.shadow_detected = detected
+        self.shadow_x = x
+        self.shadow_y = y
+        self.norm_dist = dist
+        self.angle = angle
+
+    def reset_timer(self):
+        self.start_time = time.time()
+
+    def callback(self, outdata, frames, time_info, status):
+        if status:
+            print(status)
+        
+        # Time management
+        current_time = time.time()
+        elapsed = current_time - self.start_time
+        progress = min(1.0, elapsed / self.total_duration)
+        
+        # Determine Phase
+        if progress < 0.33:
+            self.phase = 0 # Minimal: Pure sines, high pitch, sparse
+        elif progress < 0.66:
+            self.phase = 1 # Build-up: Added bass pulses, rhythm
+        else:
+            self.phase = 2 # Climax: Noise, heavy distortion, complex textures
+
+        # Generate time array for this block
+        t = (np.arange(frames) + self.phase_accumulator) / SAMPLERATE
+        self.phase_accumulator += frames
+        
+        # Initialize output buffer
+        output = np.zeros((frames, CHANNELS))
+        
+        # --- Sound Generation Logic (Ryoji Ikeda Style) ---
+        
+        # Base parameters mapped from tracking
+        # Distance -> Pitch / Intensity
+        # Angle -> Panning
+        
+        base_freq = 400.0 + (1.0 - self.norm_dist) * 800.0 # Closer = Higher pitch
+        if not self.shadow_detected:
+            base_freq = 100.0 # Idle hum
+            
+        # Panning (-1.0 to 1.0) based on X position
+        pan = (self.shadow_x / FRAME_WIDTH) * 2.0 - 1.0
+        left_gain = np.clip(1.0 - pan, 0, 1)
+        right_gain = np.clip(1.0 + pan, 0, 1)
+
+        # 1. High Frequency Sine (Data stream feel)
+        if self.phase >= 0:
+            # Intermittent sine beeps
+            sine_wave = np.sin(2 * np.pi * base_freq * t)
+            # Amplitude modulation (gating)
+            gate_freq = 8.0 + (progress * 20.0) # Gets faster
+            gate = np.where(np.sin(2 * np.pi * gate_freq * t) > 0.8, 1.0, 0.0)
+            
+            sig1 = sine_wave * gate * 0.1
+            output[:, 0] += sig1 * left_gain
+            output[:, 1] += sig1 * right_gain
+
+        # 2. Low Frequency Pulse (Heartbeat/Radar)
+        if self.phase >= 1 or (self.phase == 0 and self.shadow_detected):
+            pulse_freq = 60.0
+            pulse_wave = np.sin(2 * np.pi * pulse_freq * t)
+            # Sharp attack
+            pulse_wave = np.sign(pulse_wave) * (1.0 - np.abs(np.sin(2 * np.pi * pulse_freq * t))) 
+            
+            # Trigger based on distance (closer = louder/faster pulses)
+            pulse_speed = 1.0 + (1.0 - self.norm_dist) * 5.0
+            pulse_gate = np.where(np.sin(2 * np.pi * pulse_speed * t) > 0.9, 1.0, 0.0)
+            
+            sig2 = pulse_wave * pulse_gate * 0.3
+            output[:, 0] += sig2 * 0.8 # Centered bass
+            output[:, 1] += sig2 * 0.8
+
+        # 3. White Noise / Glitch (Texture)
+        if self.phase >= 2 or (self.shadow_detected and random.random() < 0.05):
+            noise = np.random.uniform(-1, 1, frames)
+            
+            # Glitch bursts
+            burst_prob = 0.01 + (progress * 0.05)
+            if self.shadow_detected:
+                burst_prob += 0.05
+            
+            # Create a burst mask
+            burst_mask = np.random.choice([0, 1], size=frames, p=[1-burst_prob, burst_prob])
+            
+            sig3 = noise * burst_mask * 0.2
+            output[:, 0] += sig3 * right_gain
+            output[:, 1] += sig3 * left_gain
+
+        # 4. High Pitch Constant Tone (Tension) - Phase 2+
+        if self.phase >= 1:
+            high_freq = 12000.0
+            high_sine = np.sin(2 * np.pi * high_freq * t) * 0.02
+            output += high_sine[:, np.newaxis] # Stereo add
+
+        # Master Volume
+        output *= 0.5
+        
+        # Write to buffer
+        outdata[:] = output.astype(np.float32)
+
+    def close(self):
+        self.stream.stop()
+        self.stream.close()
 
 # --- 2. 초기화 함수 ---
 
@@ -82,16 +216,60 @@ def initialize_camera(index, width, height):
     print(f"카메라 해상도: {width}x{height}")
     return cap
 
-def initialize_osc_client(ip, port, address):
-    """OSC 클라이언트를 초기화합니다."""
-    try:
-        client = udp_client.SimpleUDPClient(ip, port)
-        print(f"OSC 클라이언트 초기화됨: {ip}:{port}, 주소: {address}")
-        return client
-    except Exception as e:
-        print(f"OSC 클라이언트 초기화 실패: {e}")
-        print("OSC 없이 계속 실행됩니다.")
-        return None
+
+
+def get_camera_names():
+    """macOS에서 system_profiler를 사용하여 연결된 카메라 이름을 가져옵니다."""
+    camera_names = []
+    if platform.system() == "Darwin":
+        try:
+            result = subprocess.run(['system_profiler', 'SPCameraDataType'], capture_output=True, text=True)
+            output = result.stdout
+            lines = output.split('\n')
+            current_camera = ""
+            for line in lines:
+                line = line.strip()
+                if line and line.endswith(":") and not line.startswith("Model ID") and not line.startswith("Unique ID"):
+                    current_camera = line[:-1]
+                    camera_names.append(current_camera)
+        except Exception as e:
+            print(f"카메라 이름 가져오기 실패: {e}")
+    return camera_names
+
+def list_available_cameras(max_cameras=5):
+    """사용 가능한 카메라 인덱스를 확인하고 출력합니다."""
+    print("사용 가능한 카메라 확인 중...")
+    
+    # 시스템에서 감지된 카메라 이름 가져오기 (참고용)
+    detected_names = get_camera_names()
+    if detected_names:
+        print("시스템에서 감지된 카메라 목록 (순서가 인덱스와 일치하지 않을 수 있음):")
+        for i, name in enumerate(detected_names):
+            print(f"  - {name}")
+    
+    available_cameras = []
+    for i in range(max_cameras):
+        cap = cv2.VideoCapture(i)
+        if cap.isOpened():
+            print(f"  [{i}] 카메라 사용 가능")
+            available_cameras.append(i)
+            cap.release()
+    
+    if not available_cameras:
+        print("  사용 가능한 카메라를 찾을 수 없습니다.")
+    
+    return available_cameras
+
+# def initialize_osc_client(ip, port, address):
+#     """OSC 클라이언트를 초기화합니다. (현재 미사용)"""
+#     try:
+#         client = udp_client.SimpleUDPClient(ip, port)
+#         print(f"OSC 클라이언트 초기화됨: {ip}:{port}, 주소: {address}")
+#         return client
+#     except Exception as e:
+#         print(f"OSC 클라이언트 초기화 실패: {e}")
+#         print("OSC 없이 계속 실행됩니다.")
+#         return None
 
 def setup_control_panel(width, height):
     """디버그 및 제어판 창과 트랙바를 설정합니다."""
@@ -119,55 +297,7 @@ def get_trackbar_values():
     min_contour_area = cv2.getTrackbarPos('Min Area', 'Control Panel')
     return max(1, roi_radius), max(1, threshold_value), max(1, min_contour_area)
 
-# --- 3. 오디오 처리 함수 ---
-
-def audio_callback(indata, frames, time_info, status):
-    """sounddevice로부터 오디오 데이터를 받아 큐에 넣는 콜백 함수"""
-    if status:
-        print(status)
-    q.put(indata[::, 0])
-
-def audio_processing_thread_func():
-    """오디오 데이터를 처리 (FFT)하고 전역 변수를 업데이트하는 스레드 함수."""
-    # global current_fft_data # 더 이상 사용하지 않으므로 제거합니다.
-    try:
-        with sd.InputStream(samplerate=SAMPLERATE, blocksize=BLOCKSIZE,
-                            channels=CHANNELS, callback=audio_callback,
-                            device=AUDIO_DEVICE_INDEX):
-            print("\n--- 오디오 스트림 시작 ---")
-            print(f"오디오 장치: {sd.query_devices(AUDIO_DEVICE_INDEX, 'input')['name'] if AUDIO_DEVICE_INDEX is not None else '기본 입력 장치'}")
-            print(f"샘플링 레이트: {SAMPLERATE} Hz")
-            print(f"블록 크기 (FFT): {BLOCKSIZE} 샘플")
-            print("------------------------\n")
-            
-            while True:
-                try:
-                    audio_block = q.get(timeout=1.0)
-                    
-                    # FFT 계산은 더 이상 시각화에 필요 없으므로 제거합니다.
-                    # window = np.hanning(len(audio_block))
-                    # windowed_block = audio_block * window
-                    # fft_result = np.fft.rfft(windowed_block)
-                    # amplitude_spectrum = np.abs(fft_result) / BLOCKSIZE
-                    # min_db = -60
-                    # max_db = 0
-                    # amplitude_spectrum_log = 20 * np.log10(amplitude_spectrum + 1e-10)
-                    # normalized_spectrum = (amplitude_spectrum_log - min_db) / (max_db - min_db)
-                    # normalized_spectrum = np.clip(normalized_spectrum, 0, 1)
-                    
-                    with audio_data_lock:
-                        # current_fft_data = normalized_spectrum # 이 줄은 더 이상 필요 없으므로 제거합니다.
-                        pass # FFT 데이터 업데이트 대신, 이제는 아무것도 하지 않습니다.
-                        
-                except queue.Empty:
-                    pass
-                except Exception as e:
-                    print(f"오디오 처리 스레드 내부 오류: {e}")
-                    break
-    except Exception as e:
-        print(f"오디오 스트림 초기화 오류: {e}")
-
-# --- 4. 핵심 이미지 처리 함수 ---
+# --- 3. 핵심 이미지 처리 함수 ---
 
 def process_frame_for_shadow(frame, center_x, center_y, roi_radius, threshold_value, min_contour_area):
     """
@@ -214,7 +344,7 @@ def process_frame_for_shadow(frame, center_x, center_y, roi_radius, threshold_va
 
     return (shadow_x, shadow_y, normalized_distance, angle_degrees, is_shadow_detected), largest_contour_found, binary_frame_masked
 
-# --- 5. 시각화 및 효과 함수 ---
+# --- 4. 시각화 및 효과 함수 ---
 
 def draw_base_visualization(vis_frame, center_x, center_y, roi_radius, shadow_x, shadow_y, normalized_distance, largest_contour_found, is_shadow_detected, white_color):
     """기본 ROI, 중심, 그림자 윤곽선 및 정보를 그립니다."""
@@ -356,7 +486,7 @@ def update_and_draw_cubes(vis_frame, current_time):
             vis_frame[y1:y2, 0:FRAME_WIDTH] = vis_frame_region
     return vis_frame
 
-def draw_info_overlay(vis_frame, shadow_x, shadow_y, normalized_distance, angle_degrees, is_shadow_detected, fps, white_color):
+def draw_info_overlay(vis_frame, shadow_x, shadow_y, normalized_distance, angle_degrees, is_shadow_detected, fps, white_color, sound_engine):
     """디버그 정보 텍스트 오버레이를 그립니다."""
     global show_info_text
 
@@ -371,6 +501,12 @@ def draw_info_overlay(vis_frame, shadow_x, shadow_y, normalized_distance, angle_
         cv2.putText(vis_frame, f'Norm Dist: {normalized_distance:.2f}', (10, 60), font, font_scale, white_color, font_thickness)
         cv2.putText(vis_frame, f'Angle: {angle_degrees:.2f} deg', (10, 90), font, font_scale, white_color, font_thickness)
         cv2.putText(vis_frame, f'Status: {status_text}', (10, 120), font, font_scale, white_color, font_thickness)
+        
+        # Sound Info
+        elapsed = time.time() - sound_engine.start_time
+        phase_name = ["Minimal", "Build-up", "Climax"][sound_engine.phase]
+        cv2.putText(vis_frame, f'Time: {elapsed:.1f}s / {sound_engine.total_duration}s', (10, 150), font, font_scale, white_color, font_thickness)
+        cv2.putText(vis_frame, f'Phase: {phase_name}', (10, 180), font, font_scale, white_color, font_thickness)
         
         fps_text = f"FPS: {int(fps)}"
         cv2.putText(vis_frame, fps_text, (FRAME_WIDTH - 150, 30), font, font_scale, white_color, font_thickness)
@@ -387,9 +523,9 @@ def draw_view_indicator(frame):
     cv2.putText(frame, view_text, (FRAME_WIDTH - 200, FRAME_HEIGHT - 20), 
                 font, 0.6, (255, 255, 255), 1)
 
-# --- 6. 키 입력 처리 함수 ---
+# --- 5. 키 입력 처리 함수 ---
 
-def handle_key_press(key):
+def handle_key_press(key, sound_engine):
     """키 입력 이벤트를 처리하고 관련 전역 상태를 업데이트합니다."""
     global show_info_text, white_flash_active, flash_start_time, echo_active, glitch_active
     global cube_states, current_view_mode
@@ -428,9 +564,13 @@ def handle_key_press(key):
             print("글리치 효과 활성화됨.")
         else:
             print("글리치 효과 비활성화됨.")
+    elif key == ord('r'):
+        sound_engine.reset_timer()
+        print("사운드 퍼포먼스 타이머 리셋.")
+        
     return False
 
-# --- 7. 메인 함수 ---
+# --- 6. 메인 함수 ---
 
 def main():
     """프로그램의 메인 실행 루프입니다."""
@@ -443,41 +583,57 @@ def main():
     print("  N - Cube animation")
     print("  M - Echo effect")
     print("  V - Glitch effect")
+    print("  R - Reset Sound Timer")
     print("  H - Toggle info display")
     print("  P - Quit")
     print("============================\n")
     
-    # 7.1. 초기화
+    # 6.1. 초기화
+    available_indices = list_available_cameras()
+    current_camera_index = CAMERA_INDEX
+    if available_indices:
+        current_camera_index = available_indices[0] # 첫 번째 가능한 카메라를 기본값으로
+    
     try:
-        cap = initialize_camera(CAMERA_INDEX, FRAME_WIDTH, FRAME_HEIGHT)
+        user_input = input(f"사용할 카메라 인덱스를 입력하세요 (Enter for default {current_camera_index}): ")
+        if user_input.strip():
+            current_camera_index = int(user_input)
+            print(f"카메라 인덱스 {current_camera_index}로 설정되었습니다.")
+        else:
+            print(f"기본 카메라 인덱스 {current_camera_index}를 사용합니다.")
+    except ValueError:
+        print(f"잘못된 입력입니다. 기본값 {current_camera_index}를 사용합니다.")
+
+    try:
+        cap = initialize_camera(current_camera_index, FRAME_WIDTH, FRAME_HEIGHT)
     except IOError as e:
         print(e)
         return
 
-    client = initialize_osc_client(OSC_IP, OSC_PORT, OSC_ADDRESS)
+    # client = initialize_osc_client(OSC_IP, OSC_PORT, OSC_ADDRESS) # OSC 미사용으로 주석 처리
     setup_control_panel(FRAME_WIDTH, FRAME_HEIGHT)
 
-    audio_thread = threading.Thread(target=audio_processing_thread_func, daemon=True)
-    audio_thread.start()
+    # 사운드 엔진 초기화
+    try:
+        sound_engine = SoundEngine()
+        print("사운드 엔진 시작됨 (Ryoji Ikeda Style)")
+    except Exception as e:
+        print(f"사운드 엔진 초기화 실패: {e}")
+        return
 
     # FPS 계산을 위한 변수
     prev_frame_time = 0
 
-    # 7.2. 메인 루프
+    # 6.2. 메인 루프
     try:
         while True:
             ret, frame = cap.read()
             if not ret:
                 print("경고: 프레임을 읽을 수 없습니다. 카메라 재연결을 시도합니다...")
-                try:
-                    if client is not None:
-                        client.send_message(OSC_ADDRESS, [-1, -1, -1.0, -1.0, 0])
-                except Exception as e:
-                    print(f"OSC 오류 메시지 전송 실패: {e}")
                 time.sleep(0.1)
                 cap.release()
                 try:
-                    cap = initialize_camera(CAMERA_INDEX, FRAME_WIDTH, FRAME_HEIGHT)
+                    cap = initialize_camera(current_camera_index, FRAME_WIDTH, FRAME_HEIGHT)
                 except IOError as e:
                     print(f"카메라 재연결 실패: {e}")
                     break
@@ -494,14 +650,17 @@ def main():
                                         current_roi_radius, current_threshold_value, current_min_contour_area)
             shadow_x, shadow_y, normalized_distance, angle_degrees, is_shadow_detected = shadow_data
 
-            # OSC 메시지 전송
-            detection_status = int(is_shadow_detected)
-            try:
-                if client is not None:
-                    client.send_message(OSC_ADDRESS, [shadow_x, shadow_y, normalized_distance, angle_degrees, detection_status])
-            except Exception as e:
-                print(f"OSC 메시지 전송 실패: {e}")
-                # OSC 전송 실패해도 계속 실행
+            # OSC 메시지 전송 (주석 처리됨)
+            # detection_status = int(is_shadow_detected)
+            # try:
+            #     if client is not None:
+            #         client.send_message(OSC_ADDRESS, [shadow_x, shadow_y, normalized_distance, angle_degrees, detection_status])
+            # except Exception as e:
+            #     print(f"OSC 메시지 전송 실패: {e}")
+            #     # OSC 전송 실패해도 계속 실행
+
+            # 사운드 엔진 업데이트
+            sound_engine.update_tracking(is_shadow_detected, shadow_x, shadow_y, normalized_distance, angle_degrees)
 
             # 시각화 프레임 준비
             vis_frame = frame.copy()
@@ -513,9 +672,6 @@ def main():
                 vis_frame = draw_base_visualization(vis_frame, FRAME_WIDTH // 2, FRAME_HEIGHT // 2, current_roi_radius, 
                                                     shadow_x, shadow_y, normalized_distance, largest_contour_found, is_shadow_detected, white_color)
                 
-                # --- 오른쪽 아래 오디오 스펙트럼 바 삭제됨 ---
-                # draw_audio_visualizer(vis_frame, white_color) 호출이 삭제되었습니다.
-
                 # 글리치 효과 적용
                 global glitch_active, GLITCH_STRENGTH, GLITCH_NUM_EFFECTS
                 vis_frame = apply_glitch_effect(vis_frame, glitch_active, GLITCH_STRENGTH, GLITCH_NUM_EFFECTS)
@@ -537,7 +693,7 @@ def main():
                 prev_frame_time = current_time
 
                 # 디버그 정보 오버레이 그리기
-                vis_frame = draw_info_overlay(vis_frame, shadow_x, shadow_y, normalized_distance, angle_degrees, is_shadow_detected, fps, white_color)
+                vis_frame = draw_info_overlay(vis_frame, shadow_x, shadow_y, normalized_distance, angle_degrees, is_shadow_detected, fps, white_color, sound_engine)
                 
             elif current_view_mode == 2:  # Binary Mask
                 # 바이너리 마스크를 3채널로 변환하여 표시
@@ -554,7 +710,7 @@ def main():
 
             # 키 입력 처리
             key = cv2.waitKey(1) & 0xFF
-            if handle_key_press(key):
+            if handle_key_press(key, sound_engine):
                 break
 
     except Exception as e:
@@ -563,7 +719,8 @@ def main():
         traceback.print_exc()
 
     finally:
-        # 7.3. 정리 (Cleanup)
+        # 6.3. 정리 (Cleanup)
+        sound_engine.close()
         cap.release()
         cv2.destroyAllWindows()
         print("카메라 및 모든 창이 해제되었습니다. 프로그램 종료.")
