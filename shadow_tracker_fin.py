@@ -61,6 +61,11 @@ glitch_active = False
 GLITCH_STRENGTH = 20
 GLITCH_NUM_EFFECTS = 5
 
+# --- 오토 파일럿 설정 ---
+auto_pilot_active = True
+last_beat_time = 0
+beat_count = 0
+
 # --- 오디오 설정 (Sound Engine) ---
 SAMPLERATE = 44100
 BLOCKSIZE = 1024 # Latency vs Stability
@@ -70,7 +75,7 @@ class SoundEngine:
     def __init__(self):
         self.active = True
         self.start_time = time.time()
-        self.phase = 0 # 0: Intro, 1: Build-up, 2: Climax/Noise
+        self.phase = 0 # 0: Data Stream, 1: Pulse/Rhythm, 2: Entropy/Noise
         
         # Tracking Data
         self.shadow_detected = False
@@ -78,14 +83,17 @@ class SoundEngine:
         self.angle = 0.0
         self.shadow_x = 0
         self.shadow_y = 0
+        self.shadow_area = 0.0 # New: Shadow size
         
         # Audio State
         self.phase_accumulator = 0.0
         self.pulse_accumulator = 0.0
         self.glitch_timer = 0.0
+        self.random_seed = 0.0
         
         # Performance Config
-        self.total_duration = 180.0 # 3 minutes
+        self.total_duration = 120.0 # 2 minutes (Compressed)
+        self.current_bpm = 120.0
         
         # Stream
         self.stream = sd.OutputStream(
@@ -96,12 +104,13 @@ class SoundEngine:
         )
         self.stream.start()
 
-    def update_tracking(self, detected, x, y, dist, angle):
+    def update_tracking(self, detected, x, y, dist, angle, area):
         self.shadow_detected = detected
         self.shadow_x = x
         self.shadow_y = y
         self.norm_dist = dist
         self.angle = angle
+        self.shadow_area = area
 
     def reset_timer(self):
         self.start_time = time.time()
@@ -115,13 +124,17 @@ class SoundEngine:
         elapsed = current_time - self.start_time
         progress = min(1.0, elapsed / self.total_duration)
         
-        # Determine Phase
+        # Determine Phase (Ryoji Ikeda Structure)
+        # 0-33%: "Spectra" - Pure sines, high freq, data sonification
+        # 33-66%: "Pulse" - Hard kicks, rhythmic clicks, radar sounds
+        # 66-100%: "Matrix" - White noise, heavy glitch, intense stereo
+        
         if progress < 0.33:
-            self.phase = 0 # Minimal: Pure sines, high pitch, sparse
+            self.phase = 0 
         elif progress < 0.66:
-            self.phase = 1 # Build-up: Added bass pulses, rhythm
+            self.phase = 1 
         else:
-            self.phase = 2 # Climax: Noise, heavy distortion, complex textures
+            self.phase = 2 
 
         # Generate time array for this block
         t = (np.arange(frames) + self.phase_accumulator) / SAMPLERATE
@@ -130,72 +143,105 @@ class SoundEngine:
         # Initialize output buffer
         output = np.zeros((frames, CHANNELS))
         
-        # --- Sound Generation Logic (Ryoji Ikeda Style) ---
+        # --- Sound Generation Logic (Ryoji Ikeda Style Enhanced) ---
         
-        # Base parameters mapped from tracking
-        # Distance -> Pitch / Intensity
-        # Angle -> Panning
+        # Parameter Mapping
+        # X Axis -> Stereo Panning (Left <-> Right)
+        # Y Axis -> Timbre / Filter (Top: Clean, Bottom: Dirty/Noisy)
+        # Distance -> Intensity / Pitch
+        # Area -> Density / Volume
         
-        base_freq = 400.0 + (1.0 - self.norm_dist) * 800.0 # Closer = Higher pitch
-        if not self.shadow_detected:
-            base_freq = 100.0 # Idle hum
+        pan = (self.shadow_x / FRAME_WIDTH) * 2.0 - 1.0 # -1.0 to 1.0
+        pan = np.clip(pan, -1.0, 1.0)
+        
+        # Hard panning for Ikeda style (Binary stereo)
+        if abs(pan) < 0.2: pan = 0.0
+        elif pan > 0: pan = 0.8
+        else: pan = -0.8
             
-        # Panning (-1.0 to 1.0) based on X position
-        pan = (self.shadow_x / FRAME_WIDTH) * 2.0 - 1.0
         left_gain = np.clip(1.0 - pan, 0, 1)
         right_gain = np.clip(1.0 + pan, 0, 1)
-
-        # 1. High Frequency Sine (Data stream feel)
+        
+        y_mod = self.shadow_y / FRAME_HEIGHT # 0.0 (Top) to 1.0 (Bottom)
+        
+        # 1. "Spectra" - High Frequency Sine (Data Stream)
         if self.phase >= 0:
-            # Intermittent sine beeps
-            sine_wave = np.sin(2 * np.pi * base_freq * t)
-            # Amplitude modulation (gating)
-            gate_freq = 8.0 + (progress * 20.0) # Gets faster
-            gate = np.where(np.sin(2 * np.pi * gate_freq * t) > 0.8, 1.0, 0.0)
+            # Base high pitch sine (Signature Ikeda sound)
+            # Frequencies often used: 15kHz+, or very pure low sines
             
-            sig1 = sine_wave * gate * 0.1
-            output[:, 0] += sig1 * left_gain
-            output[:, 1] += sig1 * right_gain
-
-        # 2. Low Frequency Pulse (Heartbeat/Radar)
-        if self.phase >= 1 or (self.phase == 0 and self.shadow_detected):
-            pulse_freq = 60.0
-            pulse_wave = np.sin(2 * np.pi * pulse_freq * t)
-            # Sharp attack
-            pulse_wave = np.sign(pulse_wave) * (1.0 - np.abs(np.sin(2 * np.pi * pulse_freq * t))) 
+            # Two interacting sine waves
+            f1 = 2000.0 + (1.0 - self.norm_dist) * 1000.0
+            f2 = f1 + 4.0 # Beating frequency
             
-            # Trigger based on distance (closer = louder/faster pulses)
-            pulse_speed = 1.0 + (1.0 - self.norm_dist) * 5.0
-            pulse_gate = np.where(np.sin(2 * np.pi * pulse_speed * t) > 0.9, 1.0, 0.0)
+            sine1 = np.sin(2 * np.pi * f1 * t)
+            sine2 = np.sin(2 * np.pi * f2 * t)
             
-            sig2 = pulse_wave * pulse_gate * 0.3
-            output[:, 0] += sig2 * 0.8 # Centered bass
-            output[:, 1] += sig2 * 0.8
-
-        # 3. White Noise / Glitch (Texture)
-        if self.phase >= 2 or (self.shadow_detected and random.random() < 0.05):
-            noise = np.random.uniform(-1, 1, frames)
+            # Data gating (Morse code-like beeps)
+            # Speed increases with Y position
+            gate_speed = 10.0 + (y_mod * 40.0) 
+            gate = np.where(np.sin(2 * np.pi * gate_speed * t) > 0.9, 1.0, 0.0)
             
-            # Glitch bursts
-            burst_prob = 0.01 + (progress * 0.05)
+            sig1 = (sine1 + sine2) * 0.5 * gate * 0.15
+            
             if self.shadow_detected:
-                burst_prob += 0.05
+                output[:, 0] += sig1 * left_gain
+                output[:, 1] += sig1 * right_gain
+            else:
+                # Idle sound: Very quiet high pitch constant
+                output += np.sin(2 * np.pi * 15000 * t)[:, np.newaxis] * 0.01
+
+        # 2. "Pulse" - Rhythmic Clicks and Bass (Heartbeat)
+        if self.phase >= 1 or (self.phase == 0 and self.shadow_detected and self.norm_dist < 0.3):
+            # Impulse / Click
+            # Ryoji Ikeda uses very short samples (1-2ms). We simulate with filtered noise or short envelope sine.
             
-            # Create a burst mask
-            burst_mask = np.random.choice([0, 1], size=frames, p=[1-burst_prob, burst_prob])
+            bpm = 120.0 + (progress * 60.0)
+            self.current_bpm = bpm
+            beat_interval = 60.0 / bpm
             
-            sig3 = noise * burst_mask * 0.2
-            output[:, 0] += sig3 * right_gain
+            # Simple beat generation using modulo time
+            beat_trigger = np.mod(t, beat_interval)
+            # Sharp decay envelope
+            envelope = np.exp(-beat_trigger * 100.0) 
+            
+            # Carrier: Low sine for bass, Noise for click
+            kick = np.sin(2 * np.pi * 60 * t) * envelope * 0.8
+            click = np.random.uniform(-1, 1, frames) * envelope * 0.3
+            
+            sig2 = kick + click
+            
+            # Only play if shadow is active or in later phases
+            if self.shadow_detected or self.phase >= 1:
+                # In phase 1, movement affects rhythm subdivision
+                if self.norm_dist < 0.5:
+                    # Double time
+                    beat_trigger_2 = np.mod(t, beat_interval / 2.0)
+                    envelope_2 = np.exp(-beat_trigger_2 * 100.0)
+                    sig2 += (np.random.uniform(-1, 1, frames) * envelope_2 * 0.2)
+                
+                output[:, 0] += sig2 * 0.6 # Center focused
+                output[:, 1] += sig2 * 0.6
+
+        # 3. "Matrix" - Pure Noise and Glitch (Entropy)
+        if self.phase >= 2:
+            # White noise bursts
+            noise = np.random.uniform(-0.5, 0.5, frames)
+            
+            # Glitch probability increases with shadow area
+            glitch_prob = 0.05 + (self.shadow_area / (FRAME_WIDTH * FRAME_HEIGHT)) * 0.5
+            glitch_prob = min(glitch_prob, 0.8)
+            
+            # Random gating
+            glitch_mask = np.random.choice([0, 1], size=frames, p=[1-glitch_prob, glitch_prob])
+            
+            sig3 = noise * glitch_mask * 0.4
+            
+            # Stereo spread based on X
+            output[:, 0] += sig3 * right_gain # Invert for disorientation
             output[:, 1] += sig3 * left_gain
 
-        # 4. High Pitch Constant Tone (Tension) - Phase 2+
-        if self.phase >= 1:
-            high_freq = 12000.0
-            high_sine = np.sin(2 * np.pi * high_freq * t) * 0.02
-            output += high_sine[:, np.newaxis] # Stereo add
-
-        # Master Volume
-        output *= 0.5
+        # Master Limiter
+        output = np.clip(output, -0.8, 0.8)
         
         # Write to buffer
         outdata[:] = output.astype(np.float32)
@@ -276,7 +322,8 @@ def setup_control_panel(width, height):
     def on_trackbar(val):
         pass
 
-    cv2.namedWindow('Main View')
+    cv2.namedWindow('Main View', cv2.WINDOW_NORMAL) # Fullscreen support
+    cv2.moveWindow('Main View', 0, 0) # 창 위치를 좌상단으로 고정
     cv2.namedWindow('Control Panel')
 
     max_roi_radius = min(width, height) // 2 - 10
@@ -504,7 +551,7 @@ def draw_info_overlay(vis_frame, shadow_x, shadow_y, normalized_distance, angle_
         
         # Sound Info
         elapsed = time.time() - sound_engine.start_time
-        phase_name = ["Minimal", "Build-up", "Climax"][sound_engine.phase]
+        phase_name = ["Spectra (Sine)", "Pulse (Rhythm)", "Matrix (Noise)"][sound_engine.phase]
         cv2.putText(vis_frame, f'Time: {elapsed:.1f}s / {sound_engine.total_duration}s', (10, 150), font, font_scale, white_color, font_thickness)
         cv2.putText(vis_frame, f'Phase: {phase_name}', (10, 180), font, font_scale, white_color, font_thickness)
         
@@ -512,6 +559,10 @@ def draw_info_overlay(vis_frame, shadow_x, shadow_y, normalized_distance, angle_
         cv2.putText(vis_frame, fps_text, (FRAME_WIDTH - 150, 30), font, font_scale, white_color, font_thickness)
 
         cv2.putText(vis_frame, f'Info text toggle: Press H', (10, FRAME_HEIGHT - 10), cv2.FONT_HERSHEY_PLAIN, 1, white_color, 1)
+        cv2.putText(vis_frame, f'Fullscreen: Press F', (10, FRAME_HEIGHT - 30), cv2.FONT_HERSHEY_PLAIN, 1, white_color, 1)
+        
+        auto_text = "AUTO: ON" if auto_pilot_active else "AUTO: OFF"
+        cv2.putText(vis_frame, f'{auto_text} (Press A)', (10, FRAME_HEIGHT - 50), cv2.FONT_HERSHEY_PLAIN, 1, white_color, 1)
     return vis_frame
 
 def draw_view_indicator(frame):
@@ -528,7 +579,8 @@ def draw_view_indicator(frame):
 def handle_key_press(key, sound_engine):
     """키 입력 이벤트를 처리하고 관련 전역 상태를 업데이트합니다."""
     global show_info_text, white_flash_active, flash_start_time, echo_active, glitch_active
-    global cube_states, current_view_mode
+    global cube_states, current_view_mode, auto_pilot_active
+
 
     if key == ord('p'):  # 'p' 키로 프로그램 종료
         print("프로그램을 종료합니다.")
@@ -567,8 +619,77 @@ def handle_key_press(key, sound_engine):
     elif key == ord('r'):
         sound_engine.reset_timer()
         print("사운드 퍼포먼스 타이머 리셋.")
+    elif key == ord('f'):
+        # Toggle Fullscreen
+        prop = cv2.getWindowProperty('Main View', cv2.WND_PROP_FULLSCREEN)
+        if prop == cv2.WINDOW_FULLSCREEN:
+            cv2.setWindowProperty('Main View', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
+        else:
+            cv2.setWindowProperty('Main View', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+            cv2.moveWindow('Main View', 0, 0) # 상단 여백 제거를 위해 위치 강제 조정
+    elif key == ord('a'):
+        auto_pilot_active = not auto_pilot_active
+        print(f"오토 파일럿 {'활성화' if auto_pilot_active else '비활성화'}")
         
     return False
+
+def process_auto_pilot(sound_engine, current_time):
+    """사운드 엔진의 상태에 따라 시각 효과를 자동으로 트리거합니다."""
+    global white_flash_active, flash_start_time, echo_active, glitch_active
+    global cube_states, current_view_mode, last_beat_time, beat_count, auto_pilot_active
+
+    if not auto_pilot_active:
+        return
+
+    # BPM Sync
+    bpm = sound_engine.current_bpm
+    beat_interval = 60.0 / bpm
+    
+    # 비트 감지 (시간 기반 근사치)
+    if current_time - last_beat_time >= beat_interval:
+        last_beat_time = current_time
+        beat_count += 1
+        is_strong_beat = (beat_count % 4 == 0)
+        
+        # Phase 0: Spectra (0-33%) - 정적, 큐브 효과
+        if sound_engine.phase == 0:
+            if beat_count % 16 == 0: # 16비트마다 큐브
+                for i in range(NUM_CUBES):
+                    cube_states[i]['active'] = True
+                    cube_states[i]['start_time'] = current_time + i * CUBE_DELAY_PER_CUBE
+                    cube_states[i]['alpha'] = 0.0
+                    cube_states[i]['phase'] = 'fade_in'
+            
+            # 초기화
+            if glitch_active: glitch_active = False
+            if echo_active: echo_active = False
+            if current_view_mode != 1: current_view_mode = 1
+
+        # Phase 1: Pulse (33-66%) - 리듬, 플래시, 간헐적 글리치
+        elif sound_engine.phase == 1:
+            if is_strong_beat: # 4비트마다 플래시
+                white_flash_active = True
+                flash_start_time = current_time
+            
+            if beat_count % 8 == 0: # 8비트마다 글리치 토글
+                glitch_active = not glitch_active
+            
+            if current_view_mode != 1: current_view_mode = 1
+            if echo_active: echo_active = False
+
+        # Phase 2: Matrix (66-100%) - 카오스, 에코, 잦은 글리치, 뷰 전환
+        elif sound_engine.phase == 2:
+            if beat_count % 2 == 0: # 2비트마다 플래시 (빠름)
+                white_flash_active = True
+                flash_start_time = current_time
+            
+            # 항상 글리치/에코 활성화
+            if not glitch_active: glitch_active = True
+            if not echo_active: echo_active = True
+            
+            # 4비트마다 뷰 모드 랜덤 전환
+            if beat_count % 4 == 0:
+                current_view_mode = 2 if random.random() > 0.6 else 1
 
 # --- 6. 메인 함수 ---
 
@@ -585,6 +706,8 @@ def main():
     print("  V - Glitch effect")
     print("  R - Reset Sound Timer")
     print("  H - Toggle info display")
+    print("  F - Toggle Fullscreen")
+    print("  A - Toggle Auto Pilot")
     print("  P - Quit")
     print("============================\n")
     
@@ -616,7 +739,7 @@ def main():
     # 사운드 엔진 초기화
     try:
         sound_engine = SoundEngine()
-        print("사운드 엔진 시작됨 (Ryoji Ikeda Style)")
+        print("사운드 엔진 시작됨 (Ryoji Ikeda Style - 2 Min)")
     except Exception as e:
         print(f"사운드 엔진 초기화 실패: {e}")
         return
@@ -650,6 +773,11 @@ def main():
                                         current_roi_radius, current_threshold_value, current_min_contour_area)
             shadow_x, shadow_y, normalized_distance, angle_degrees, is_shadow_detected = shadow_data
 
+            # Calculate Shadow Area for Sound
+            shadow_area = 0.0
+            if largest_contour_found is not None:
+                shadow_area = cv2.contourArea(largest_contour_found)
+
             # OSC 메시지 전송 (주석 처리됨)
             # detection_status = int(is_shadow_detected)
             # try:
@@ -660,7 +788,10 @@ def main():
             #     # OSC 전송 실패해도 계속 실행
 
             # 사운드 엔진 업데이트
-            sound_engine.update_tracking(is_shadow_detected, shadow_x, shadow_y, normalized_distance, angle_degrees)
+            sound_engine.update_tracking(is_shadow_detected, shadow_x, shadow_y, normalized_distance, angle_degrees, shadow_area)
+
+            # 오토 파일럿 처리
+            process_auto_pilot(sound_engine, current_time)
 
             # 시각화 프레임 준비
             vis_frame = frame.copy()
