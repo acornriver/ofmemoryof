@@ -92,7 +92,7 @@ class SoundEngine:
         self.random_seed = 0.0
         
         # Performance Config
-        self.total_duration = 120.0 # 2 minutes (Compressed)
+        self.total_duration = 200.0 # 200 seconds (Extended)
         self.current_bpm = 120.0
         
         # Stream
@@ -129,12 +129,20 @@ class SoundEngine:
         # 33-66%: "Pulse" - Hard kicks, rhythmic clicks, radar sounds
         # 66-100%: "Matrix" - White noise, heavy glitch, intense stereo
         
-        if progress < 0.33:
+        # Determine Phase (Ryoji Ikeda Structure)
+        # 0-30%: "Spectra" - Pure sines, high freq, data sonification
+        # 30-60%: "Pulse" - Hard kicks, rhythmic clicks, radar sounds
+        # 60-85%: "Matrix" - White noise, heavy glitch, intense stereo
+        # 85-100%: "Terminal" - Climax, Distortion, Feedback
+        
+        if progress < 0.30:
             self.phase = 0 
-        elif progress < 0.66:
+        elif progress < 0.60:
             self.phase = 1 
-        else:
+        elif progress < 0.85:
             self.phase = 2 
+        else:
+            self.phase = 3 # Climax 
 
         # Generate time array for this block
         t = (np.arange(frames) + self.phase_accumulator) / SAMPLERATE
@@ -239,6 +247,23 @@ class SoundEngine:
             # Stereo spread based on X
             output[:, 0] += sig3 * right_gain # Invert for disorientation
             output[:, 1] += sig3 * left_gain
+
+        # 4. "Terminal" - Climax (Distortion & Feedback)
+        if self.phase == 3:
+            # Intense high-pitch feedback sweep
+            f_scream = 3000.0 + (np.sin(elapsed * 15.0) * 2000.0)
+            scream = np.sin(2 * np.pi * f_scream * t) * 0.15
+            
+            # Sub-bass drone
+            sub = np.sin(2 * np.pi * 45 * t) * 0.4
+            
+            # Add to output
+            output[:, 0] += scream + sub
+            output[:, 1] += scream + sub
+            
+            # Hard Clipping / Distortion of the entire mix
+            output *= 1.5 # Boost gain
+            # Clipping happens at the end (Master Limiter)
 
         # Master Limiter
         output = np.clip(output, -0.8, 0.8)
@@ -551,7 +576,8 @@ def draw_info_overlay(vis_frame, shadow_x, shadow_y, normalized_distance, angle_
         
         # Sound Info
         elapsed = time.time() - sound_engine.start_time
-        phase_name = ["Spectra (Sine)", "Pulse (Rhythm)", "Matrix (Noise)"][sound_engine.phase]
+        phase_names = ["Spectra (Sine)", "Pulse (Rhythm)", "Matrix (Noise)", "Terminal (Climax)"]
+        phase_name = phase_names[sound_engine.phase] if sound_engine.phase < len(phase_names) else "Unknown"
         cv2.putText(vis_frame, f'Time: {elapsed:.1f}s / {sound_engine.total_duration}s', (10, 150), font, font_scale, white_color, font_thickness)
         cv2.putText(vis_frame, f'Phase: {phase_name}', (10, 180), font, font_scale, white_color, font_thickness)
         
@@ -690,6 +716,30 @@ def process_auto_pilot(sound_engine, current_time):
             # 4비트마다 뷰 모드 랜덤 전환
             if beat_count % 4 == 0:
                 current_view_mode = 2 if random.random() > 0.6 else 1
+
+        # Phase 3: Terminal (85-100%) - Climax
+        elif sound_engine.phase == 3:
+            # Extreme Flash (Every beat)
+            if beat_count % 1 == 0:
+                white_flash_active = True
+                flash_start_time = current_time
+            
+            # Constant Glitch & Echo
+            glitch_active = True
+            echo_active = True
+            
+            # Rapid View Switching (Chaos)
+            if beat_count % 2 == 0:
+                 current_view_mode = 2 if random.random() > 0.5 else 1
+            
+            # Cubes go crazy
+            if beat_count % 4 == 0:
+                for i in range(NUM_CUBES):
+                    if random.random() > 0.5:
+                        cube_states[i]['active'] = True
+                        cube_states[i]['start_time'] = current_time
+                        cube_states[i]['alpha'] = 1.0
+                        cube_states[i]['phase'] = 'fade_out'
 
 # --- 6. 메인 함수 ---
 
